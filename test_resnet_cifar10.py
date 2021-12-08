@@ -50,7 +50,7 @@ def summarize_diagnostics(history):
 	pyplot.close()
 
 # define conv layer for RESNET
-def define_conv_layer(inputs, num_filters=16, kernel_size=3, strides=1, batch_normalization=True, activation="relu"):
+def define_conv_layer(inputs, num_filters=16, kernel_size=3, strides=1, conv_first=True, batch_normalization=True, activation="relu"):
     conv = Conv2D(
         filters=num_filters,
         kernel_size=kernel_size,
@@ -59,11 +59,15 @@ def define_conv_layer(inputs, num_filters=16, kernel_size=3, strides=1, batch_no
         kernel_initializer='he_normal',
         kernel_regularizer=l2(1e-4)
     )
-    x = conv(inputs)
+    x = inputs
+    if conv_first:
+        x = conv(x)
     if batch_normalization:
         x = BatchNormalization()(x)
     if activation:
         x = Activation(activation)(x)
+    if not conv_first:
+        x = conv(x)
     return x
 
 
@@ -75,7 +79,15 @@ def define_resnet_model_v1(input_shape, depth):
 
     inputs = Input(shape=input_shape)
     # add initial conv layer
-    x = define_conv_layer(inputs=inputs, num_filters=num_filters, kernel_size=3, strides=1, batch_normalization=True, activation="relu")
+    x = define_conv_layer(
+        inputs=inputs, 
+        num_filters=num_filters, 
+        kernel_size=3, 
+        strides=1, 
+        conv_first=True,
+        batch_normalization=True, 
+        activation="relu"
+        )
 
     # define three blocks of convolution layers
     for block in range(3):
@@ -85,6 +97,7 @@ def define_resnet_model_v1(input_shape, depth):
                 num_filters=num_filters,
                 kernel_size=3,
                 strides = 2 if (block > 0 and step == 0) else 1, # first step downsamples input except for the first block
+                conv_first=True,
                 batch_normalization=True,
                 activation="relu"
             )
@@ -93,6 +106,7 @@ def define_resnet_model_v1(input_shape, depth):
                 num_filters=num_filters,
                 kernel_size=3,
                 strides = 1,
+                conv_first=True,
                 batch_normalization=True,
                 activation=None
             )
@@ -104,12 +118,11 @@ def define_resnet_model_v1(input_shape, depth):
                     num_filters=num_filters,
                     kernel_size=1,
                     strides = 2,
+                    conv_first=True,
                     batch_normalization=False,
                     activation=None
                 )
             # add shortcut
-            print(block)
-            print(step)
             x = add([x, y])
             x = Activation("relu")(x)
         # double the number of filters for convolution layers
@@ -128,14 +141,98 @@ def define_resnet_model_v1(input_shape, depth):
     model = Model(inputs=inputs, outputs=outputs)
     return model
 
+def define_resnet_model_v2(input_shape, depth):
+
+    # Start model definition.
+    num_filters = 16
+    num_steps = int((depth - 2) / 9)
+
+    inputs = Input(shape=input_shape)
+    # add initial conv layer
+    x = define_conv_layer(
+        inputs=inputs, 
+        num_filters=num_filters, 
+        kernel_size=3, 
+        strides=1, 
+        conv_first=True,
+        batch_normalization=True, 
+        activation="relu"
+        )
+
+    # define three blocks of convolution layers
+    for block in range(3):
+        for step in range(num_steps):
+            y = define_conv_layer(
+                inputs=x,
+                num_filters=num_filters,
+                kernel_size=1,
+                strides=(2 if (block > 0 and step == 0) else 1), # first step downsamples input except for the first block
+                conv_first=False,
+                batch_normalization=(False if (block == 0 and step == 0) else True),
+                activation=(None if (block == 0 and step == 0) else "relu")
+            )
+            y = define_conv_layer(
+                inputs=y,
+                num_filters=num_filters,
+                kernel_size=3,
+                strides = 1,
+                conv_first=False,
+                batch_normalization=True,
+                activation="relu"
+            )
+            y = define_conv_layer(
+                inputs=y,
+                num_filters=(num_filters * 4 if block == 0 else num_filters * 2),
+                kernel_size=1,
+                strides=1,
+                conv_first=False,
+                batch_normalization=True,
+                activation="relu"
+            )
+            # after downsample we need to adjust shortcut
+            # all other steps use identity shortcut
+            if step == 0:
+                x = define_conv_layer(
+                    inputs=x,
+                    num_filters=(num_filters * 4 if block == 0 else num_filters * 2),
+                    kernel_size=1,
+                    strides = (2 if (block > 0 and step == 0) else 1),
+                    conv_first=False,
+                    batch_normalization=False,
+                    activation=None
+                )
+            # add shortcut
+            x = add([x, y])
+
+        # increase the number of filters for convolution layers
+        num_filters = (num_filters * 4 if block == 0 else num_filters * 2)
+
+    # add classification block
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    x = AveragePooling2D(pool_size=8)(x)
+    y = Flatten()(x)
+    outputs = Dense(
+        10, # 10 classes in CIFAR10
+        activation='softmax',
+        kernel_initializer='he_normal'
+    )(y)
+
+    # Instantiate model.
+    model = Model(inputs=inputs, outputs=outputs)
+    return model
+
 # run the test harness for evaluating a model
-def run_test_harness(model_depth=20, num_epochs=10):
+def run_test_harness(model_depth=20, num_epochs=10, version="v1"):
     # load dataset
     trainX, trainY, testX, testY = load_dataset()
 	# prepare pixel data
     trainX, testX = prep_pixels(trainX, testX)
     # create RESNET model
-    model = define_resnet_model_v1(trainX.shape[1:], model_depth)
+    if version == "v1":
+        model = define_resnet_model_v1(trainX.shape[1:], model_depth)
+    else:
+        model = define_resnet_model_v2(trainX.shape[1:], model_depth)
     # compile model
     model.compile(
         loss='categorical_crossentropy',
@@ -154,8 +251,16 @@ def run_test_harness(model_depth=20, num_epochs=10):
 # run RESNET20
 run_test_harness(
     model_depth=20, 
-    num_epochs=20
+    num_epochs=20,
+    version="v1"
 )
+
+# run RESNET56
+#run_test_harness(
+#    model_depth=56, 
+#    num_epochs=20,
+#    version="v2"
+#)
 
 
 
